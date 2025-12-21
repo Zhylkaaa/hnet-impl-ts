@@ -255,6 +255,7 @@ class HNet(nn.Module):
         r_flat = self.encoder(x_flat, flat_cu, msl)
         p_flat, b_flat, select_cu = self.routing_module(r_flat, flat_cu)
 
+        # print('select_cu', select_cu)
         # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
         # To avoid this, we initiate a D2H of the inner H-Net's seqlen ASAP, and enqueue work to let the GPU race ahead.
         # Note that, if you are **already CPU bound** prior to this (e.g. in really small runs), this code is detrimental.
@@ -285,6 +286,171 @@ class HNet(nn.Module):
         )
 
         return x_flat, [extra] + extras
+
+
+class HNetEncoder(nn.Module):
+    """
+    HNetEncoder is an encoder-only version of HNet that outputs raw main_network outputs
+    without applying dechunking, residual addition, or decoder modules. This is useful for 
+    tasks that need the raw encoded representations at the compressed sequence length.
+    
+    Note: The outputs are at the compressed/selected sequence length (select_cu), not the
+    original input sequence length, since we skip the dechunking step.
+    """
+    def __init__(self, c: HNetConfig, stage_idx: int):
+        super().__init__()
+        self.stage_idx = stage_idx
+        self.d = c.d_model[stage_idx]
+        try:
+            self.n = c.N_compress[stage_idx + 1] / c.N_compress[stage_idx]
+        except IndexError:
+            self.n = None
+
+        arch_layout = c.arch_layout
+        for _ in range(stage_idx):
+            arch_layout = arch_layout[1]
+
+        assert len(arch_layout) in [3, 1]
+        self.is_innermost = len(arch_layout) == 1
+
+        if self.is_innermost:
+            self.main_network = Isotropic(
+                c, arch_layout[0], stage_idx=stage_idx
+            )  # <-- don't increment
+        else:
+            self.encoder = Isotropic(c, arch_layout[0], stage_idx=stage_idx)
+            self.main_network = HNetEncoder(c, stage_idx + 1)  # Use HNetEncoder recursively
+            # NO decoder module
+
+            self.routing_module = RoutingModule(self.d)
+
+        d_gain = self.d - c.d_model[stage_idx - 1] if stage_idx else None
+        self.pad_dimension = (
+            nn.Parameter(torch.zeros(d_gain, device="cuda")) if d_gain else None
+        )
+
+    # only compile blocks within a hnet, not the hnet itself
+    def block_compile(self, ac: bool):
+        self.main_network.block_compile(ac)
+        if self.is_innermost:
+            return
+        self.encoder.block_compile(ac)
+        # NO decoder to compile
+        self.register_module(
+            "routing_module",
+            torch.compile(self.routing_module, backend="inductor", fullgraph=True),
+        )
+        self.ratio_loss = torch.compile(
+            self.ratio_loss, backend="inductor", fullgraph=True, dynamic=True
+        )
+
+    def ratio_loss(self, b_flat: TT, p_flat: TT):
+        assert self.n, "HNetConfig did not receive valid N_compress; please edit it"
+        l = b_flat.numel()
+        f = b_flat.sum().float() / l
+        g = p_flat.float().sum() / l
+        drop_experts = self.n * (1 - f) * (1 - g) / (self.n - 1)
+        keep_expert = self.n * f * g
+        return keep_expert + drop_experts
+
+    @contextmanager
+    def least_blocking_masked_select(
+        self, *outer_flat_tensors: list[TT], mask_flat: TT, cu_seqlens: TT
+    ):
+        # WARNING: do not try to compile this. inductor will just wipe all pin memory & copy & Event & etc.
+        inner_stats_cuda = torch.stack([cu_seqlens.diff().max(), cu_seqlens[-1]])
+        inner_stats_cpu = torch.empty_like(
+            inner_stats_cuda, device="cpu", pin_memory=True
+        )
+        inner_stats_cpu.copy_(inner_stats_cuda, non_blocking=True)
+        d2h_event = torch.cuda.Event()
+        d2h_event.record()
+
+        # in the yield region, the end-user is expected to enqueue as much GPU work as possible, to make the CPU sync cheap.
+        yield (mutable_res := []), inner_stats_cpu
+
+        d2h_event.synchronize()
+        inner_flatlen = inner_stats_cpu[1].item()
+        idx_flat = mask_flat.nonzero_static(size=inner_flatlen).squeeze(-1)
+        for outer in outer_flat_tensors:
+            mutable_res.append(outer.index_select(0, idx_flat))
+
+    def forward(self, x_flat: TT, flat_cu: TT, msl: int):
+        d_orig = x_flat.shape[-1]
+        x_flat = (
+            x_flat
+            if self.pad_dimension is None
+            else torch.cat(
+                [x_flat, self.pad_dimension.expand(x_flat.shape[0], -1)], dim=-1
+            )
+        )
+        x_flat = x_flat.bfloat16()
+
+        if self.is_innermost:
+            # For innermost, just return main_network output
+            return self.main_network(x_flat, flat_cu, msl)[..., :d_orig], []
+
+        r_flat = self.encoder(x_flat, flat_cu, msl)
+        p_flat, b_flat, select_cu = self.routing_module(r_flat, flat_cu)
+
+        # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
+        # To avoid this, we initiate a D2H of the inner H-Net's seqlen ASAP, and enqueue work to let the GPU race ahead.
+        # Note that, if you are **already CPU bound** prior to this (e.g. in really small runs), this code is detrimental.
+        with self.least_blocking_masked_select(
+            p_flat, r_flat, mask_flat=b_flat, cu_seqlens=select_cu
+        ) as (pending_selected_tensors, pending_cpu_stats):
+            ratio_loss = (
+                self.ratio_loss(b_flat, p_flat) if torch.is_grad_enabled() else 0
+            )
+        p_select, r_select = pending_selected_tensors
+
+        
+        h_select, extras = self.main_network(
+            r_select, select_cu, pending_cpu_stats[0].item()
+        )
+
+        # Return raw main_network outputs without dechunking or residual addition
+        # Note: h_select is at compressed sequence length (select_cu), not original length
+        # h_select dimension matches the next stage's d_model, not d_orig
+
+        extra = HNetExtra(
+            nested.nested_tensor_from_jagged(b_flat, flat_cu, max_seqlen=msl),
+            ratio_loss,
+            p_select.numel() / p_flat.numel(),
+        )
+
+        return h_select, [extra] + extras
+
+
+class HNetTS(BlockBoundaryMixin, nn.Module):
+    def __init__(self, c: HNetConfig):
+        super().__init__()
+        self.c = c
+        v, d = c.vocab_size, c.d_model[0]
+        self.embeddings = nn.Linear(v, d)
+        self.backbone = HNetEncoder(c, stage_idx=0)
+
+
+    def forward(self, inputs: TT):
+        assert inputs.is_nested and inputs.ndim == 2
+        cu_s, msl = inputs.offsets(), inputs._max_seqlen
+        x_flat = self.embeddings(inputs.values().unsqueeze(-1))
+        h_select, extra = self.backbone(x_flat, cu_s, msl)
+        return h_select, extra
+    
+    def split_params_by_hierachy(self) -> list[list[nn.Parameter]]:
+        # for each param, count the number of times ".main_network" appears in it.
+        d = defaultdict(list)
+        for n, p in self.named_parameters():
+            d[n.count("main_network")].append(p)
+        # special-case innermost hnet which has redundant .main_network
+        max_depth = max(d.keys())
+        assert 1 == len(d[max_depth - 1]), (
+            f"expected single .pad_dimension at {max_depth - 1}"
+        )
+        d[max_depth - 1] += d.pop(max_depth)
+
+        return [d[k] for k in range(len(d))]
 
 
 class HNetLM(BlockBoundaryMixin, nn.Module):
@@ -379,6 +545,6 @@ def test_fwd_correctness():
     ), comp
 
 
-__all__ = ["HNetLM"]
+__all__ = ["HNetLM", "HNetEncoder"]
 if __name__ == "__main__":
     test_fwd_correctness()
