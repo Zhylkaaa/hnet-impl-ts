@@ -70,7 +70,7 @@ with m.sampling_mode():
 ## training loop
 zero = torch.tensor(0.0, device="cuda")
 for step, (iids, lbls) in zip(range(max_steps), random_batches()):
-    with torch.autocast("cuda", torch.bfloat16) if ws > 1 else nullcontext():
+    with torch.autocast("cuda", torch.bfloat16):
         (l_avg, l_sum), extra = m(iids.cuda(), lbls.cuda())
         l_ratio = sum([e.loss_ratio for e in extra], zero)
         loss = l_avg + l_ratio

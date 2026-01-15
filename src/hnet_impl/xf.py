@@ -139,7 +139,7 @@ class CausalMHA(nn.Module):
         freqs = torch.outer(t, inv_freq)
         return freqs.cos(), freqs.sin()
 
-    def __init__(self, d: int, num_heads: int, rotary_emb_dim: int, *, msl: int = 4096):
+    def __init__(self, d: int, num_heads: int, rotary_emb_dim: int, *, msl: int = 8192):
         super().__init__()
         # force rope cache init, even if meta device ctx is used
         with torch.device("cuda"):

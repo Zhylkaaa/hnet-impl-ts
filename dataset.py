@@ -10,11 +10,13 @@ import lightning as L
 
 
 class ECGPretrainDataset(Dataset):
-    def __init__(self, data_path: str):
+    def __init__(self, data_path: str, multichannel: bool = False):
         self.data_path = data_path
         self.data = h5py.File(data_path, "r")
         self.leads = [k for k in self.data.keys() if k not in ['cum_seq_len', 'date', 'patient_id', 'study_id']]
         self.cum_seq_len = self.data["cum_seq_len"][()]
+        self.multichannel = multichannel
+        self.pad_to_max = multichannel
 
     def __len__(self):
         return len(self.data["cum_seq_len"])
@@ -39,7 +41,7 @@ class ECGPretrainDataset(Dataset):
         ecg = self.impute(ecg)
         ecg = self.normalize(ecg)
         ecg = self.augment(ecg)
-        return ecg
+        return ecg[:, None]
     
     def impute(self, ecg: np.ndarray):
         ecg[np.isnan(ecg)] = 0
@@ -59,47 +61,72 @@ class ECGPretrainDataset(Dataset):
     def __getitem__(self, idx):
         start_idx = self.cum_seq_len[idx - 1] if idx > 0 else 0
         end_idx = self.cum_seq_len[idx]
+        if self.multichannel:
+            k_a = random.randint(1, len(self.leads))
+            k_b = random.randint(1, len(self.leads))
+        else:
+            k_a = 1
+            k_b = 1
+        leads_a = random.sample(self.leads, k_a)
+        leads_b = random.sample(self.leads, k_b)
+        ecgs_a = [self._process_ecg(lead, start_idx, end_idx) for lead in leads_a]
+        ecgs_b = [self._process_ecg(lead, start_idx, end_idx) for lead in leads_b]
         
-        lead_a = random.choice(self.leads)
-        lead_b = random.choice(self.leads)
+        ecgs_a = np.stack(ecgs_a, axis=0)
+        if self.pad_to_max and k_a < len(self.leads):
+            ecgs_a = np.concatenate([ecgs_a, np.zeros((len(self.leads) - k_a, ecgs_a.shape[1], 1))], axis=0)
+        
+        ecgs_b = np.stack(ecgs_b, axis=0)
+        if self.pad_to_max and k_b < len(self.leads):
+            ecgs_b = np.concatenate([ecgs_b, np.zeros((len(self.leads) - k_b, ecgs_b.shape[1], 1))], axis=0)
 
-        ecg_a = self._process_ecg(lead_a, start_idx, end_idx)
-        ecg_b = self._process_ecg(lead_b, start_idx, end_idx)
-        ecgs = np.stack([ecg_a, ecg_b], axis=0)
-
-        return torch.from_numpy(ecgs).float()
+        input_mask = torch.ones(2, len(self.leads) if self.pad_to_max else max(k_a, k_b), dtype=torch.bool)
+        input_mask[0, :k_a] = False
+        input_mask[1, :k_b] = False
+        ecgs = np.concatenate([ecgs_a, ecgs_b], axis=0)
+        return torch.from_numpy(ecgs).float(), input_mask
 
 
 def collate_fn(batch):
+    batch, input_mask = zip(*batch)
+    input_mask = torch.concatenate(input_mask, dim=0)
     batch = torch.concatenate(batch, dim=0)
-    labels = torch.zeros(batch.shape[0], dtype=torch.long)
-    idxs = torch.arange(batch.shape[0], dtype=torch.long)
+
+    N = input_mask.shape[0]
+    labels = torch.zeros(N, dtype=torch.long)
+    idxs = torch.arange(N, dtype=torch.long)
     labels[idxs] = idxs - (2 * (idxs % 2) - 1)
-    return batch, labels
+    return batch, labels, input_mask
 
 
-# class EGCDatamodule(L.LightningDataModule):
-class EGCDatamodule:
-    def __init__(self, base_path: str, batch_size: int, num_workers: int):
+class EGCDatamodule(L.LightningDataModule):
+    def __init__(self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False):
+        super().__init__()
         self.base_path = base_path
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"))
-        self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"))
-        self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"))
+        self.allow_zero_length_dataloader_with_multiple_devices = True
+        self.multichannel = multichannel
+        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"), multichannel=self.multichannel)
+        self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel)
+        self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel)
+        
         
         self.kwargs = {
             "batch_size": self.batch_size,
             "num_workers": self.num_workers,
             "multiprocessing_context": "spawn" if self.num_workers > 0 else None,
             "collate_fn": collate_fn,
+            'persistent_workers': self.num_workers > 0,
+            'pin_memory': True,
+            'prefetch_factor': 2,
         }
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, **self.kwargs, shuffle=True)
 
-    def val_dataloader(self):
-        return DataLoader(self.val_dataset, **self.kwargs)
+    # def val_dataloader(self):
+    #     return DataLoader(self.val_dataset, **self.kwargs)
     
-    def test_dataloader(self):
-        return DataLoader(self.test_dataset, **self.kwargs)
+    # def test_dataloader(self):
+    #     return DataLoader(self.test_dataset, **self.kwargs)

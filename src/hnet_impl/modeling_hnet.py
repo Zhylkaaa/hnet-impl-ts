@@ -7,7 +7,7 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from .torchisms import torch, TT, nn, F, nested, NJT, summon_full_params
 from .conceptual import BlockBoundaryMixin, get_seq_idx
 from .config_hnet import HNetConfig
-from .xf import Isotropic
+from .xf import Isotropic, Mamba2Simple
 from .lin import Lin, HighPrecLinear, LMHead
 
 ### ################
@@ -422,19 +422,242 @@ class HNetEncoder(nn.Module):
         return h_select, [extra] + extras
 
 
+class Mamba1DEmbedding(nn.Module):
+    def __init__(self, inner_dim: int, out_dim: int):
+        super().__init__()
+        self.embedding = nn.Linear(1, inner_dim)
+        self.mamba_embedding = Mamba2Simple(inner_dim, d_state=16, d_conv=4, expand=2, headdim=8)
+        self.lift = nn.Linear(inner_dim, out_dim, bias=False)
+
+    def forward(self, inputs: TT, input_mask: TT):
+        assert torch.all(input_mask.shape[1] == 1), "num_channels_per_example must be all 1 for mamba1d embedding"
+        b, t, _ = inputs.shape
+        inputs = self.embedding(inputs)
+        cu_s = torch.arange(t, (b + 1) * t, t, device=inputs.device)
+        x_flat = inputs.view(-1, inputs.shape[2])
+         # Pad x_flat to a multiple of 128 for kernel efficiency (same as Isotropic)
+        REQUIRED_PAD_MODULO = 128
+        original_cu_s = cu_s  # Store original for unpadding
+        if padding := (-x_flat.shape[0]) % REQUIRED_PAD_MODULO:
+            cu_s = F.pad(cu_s, (0, 1), value=padding + x_flat.shape[0])
+            x_flat = F.pad(x_flat, (0, 0, 0, padding), value=0)
+        
+        # Convert cu_seqlens to seq_idx for Mamba2Simple (similar to how encoder uses it)
+        seq_idx = get_seq_idx(cu_s, x_flat.shape[0])
+        x_flat = self.mamba_embedding(x_flat[None], seq_idx=seq_idx)[0]
+        x_flat = self.lift(x_flat)
+        
+        # Unpad before passing to backbone (backbone will apply its own padding)
+        if padding:
+            x_flat = x_flat[:x_flat.shape[0] - padding]
+            cu_s = original_cu_s  # Restore original cu_s 
+        return x_flat.view(b, t, -1)
+
+
+class MambaAttentionMultichannelEmbedding(nn.Module):
+    def __init__(self, inner_dim: int, out_dim: int):
+        super().__init__()
+        self.inner_dim = inner_dim
+        self.out_dim = out_dim
+        self.embeddings = nn.Linear(1, inner_dim)
+        self.mamba_embedding = Mamba2Simple(inner_dim, d_state=16, d_conv=4, expand=2, headdim=8)
+        # Project mamba output to consistent dimension for cross-attention
+        self.lift = nn.Linear(inner_dim, out_dim, bias=False)
+        # Cross-attention to fuse channels for each example
+        # num_heads: use 8 heads by default, adjust if needed
+        num_heads = 8
+        assert out_dim % num_heads == 0, f"out_dim ({out_dim}) must be divisible by num_heads ({num_heads})"
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=out_dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.output_proj = nn.Linear(out_dim, out_dim, bias=False)
+        # Normalization layers similar to attention blocks
+        self.pre_attn_norm = nn.RMSNorm(out_dim, eps=1e-5)
+        self.post_proj_norm = nn.RMSNorm(out_dim, eps=1e-5)
+        # Learnable query embeddings for cross-attention (one per example)
+        # These will be used to aggregate channel information
+        self.query_embeddings = nn.Parameter(torch.randn(1, 1, out_dim))
+
+
+    def forward(self, inputs: TT, input_mask: TT):
+        # Mask out padded channels from dataset to prevent gradient flow
+        # Reshape to identify which channels are padded per example
+        num_examples, max_channels = input_mask.shape
+
+        b, t, _ = inputs.shape
+        inputs = self.embeddings(inputs)
+        inputs = inputs * (~input_mask.view(-1)).unsqueeze(-1).unsqueeze(-1)
+        
+        cu_s = torch.arange(0, (b + 1) * t, t, device=inputs.device)
+        x_flat = inputs.view(-1, inputs.shape[2])
+         # Pad x_flat to a multiple of 128 for kernel efficiency (same as Isotropic)
+        REQUIRED_PAD_MODULO = 128
+        original_cu_s = cu_s  # Store original for unpadding
+        if padding := (-x_flat.shape[0]) % REQUIRED_PAD_MODULO:
+            cu_s = F.pad(cu_s, (0, 1), value=padding + x_flat.shape[0])
+            x_flat = F.pad(x_flat, (0, 0, 0, padding), value=0)
+        
+        # Convert cu_seqlens to seq_idx for Mamba2Simple (similar to how encoder uses it)
+        seq_idx = get_seq_idx(cu_s, x_flat.shape[0])
+        x_flat = self.mamba_embedding(x_flat[None], seq_idx=seq_idx)[0]
+        x_flat = self.lift(x_flat)
+        
+        # Unpad before passing to cross-attention
+        if padding:
+            x_flat = x_flat[:x_flat.shape[0] - padding]
+            cu_s = original_cu_s  # Restore original cu_s
+        
+        # Build batched tensor: (num_examples, max_channels, t, out_dim)
+        batched_embeddings = x_flat.view(num_examples, -1, t, self.out_dim)
+        batched_embeddings = batched_embeddings * (~input_mask).unsqueeze(-1).unsqueeze(-1)
+        
+        # Permute to (num_examples, t, max_channels, out_dim) for attention
+        batched_embeddings = batched_embeddings.permute(0, 2, 1, 3)  # (num_examples, t, max_channels, out_dim)
+        # Reshape to (num_examples * t, max_channels, out_dim) for batched attention
+        batched_embeddings = batched_embeddings.reshape(num_examples * t, max_channels, self.out_dim)
+        
+        # Apply pre-attention normalization to key/value embeddings
+        batched_embeddings = self.pre_attn_norm(batched_embeddings)
+        
+        # Expand query: (num_examples * t, 1, out_dim)
+        query = self.query_embeddings.expand(num_examples * t, 1, -1)
+        
+        # Create key padding mask: (num_examples * t, max_channels)
+        # Repeat mask for each timestep (same mask for all timesteps in an example)
+        key_padding_mask_expanded = input_mask.unsqueeze(1).expand(num_examples, t, max_channels)
+        key_padding_mask_expanded = key_padding_mask_expanded.reshape(num_examples * t, max_channels)
+        
+        # Apply batched cross-attention
+        attn_output, _ = self.cross_attn(query, batched_embeddings, batched_embeddings, 
+                                        key_padding_mask=key_padding_mask_expanded)  # (num_examples * t, 1, out_dim)
+        combined_embeddings = attn_output.squeeze(1)  # (num_examples * t, out_dim)
+        combined_embeddings = self.output_proj(combined_embeddings)
+        # Apply post-projection normalization
+        combined_embeddings = self.post_proj_norm(combined_embeddings)
+        return combined_embeddings.reshape(num_examples, t, -1)
+
+
+class GatedMambaMultichannelEmbedding(nn.Module):
+    def __init__(self, inner_dim: int, out_dim: int):
+        super().__init__()
+        self.inner_dim = inner_dim
+        self.out_dim = out_dim
+        self.embeddings = nn.Linear(1, inner_dim)
+        self.mamba_embedding = Mamba2Simple(inner_dim, d_state=16, d_conv=4, expand=2, headdim=8)
+        self.lift = nn.Linear(inner_dim, out_dim, bias=False)
+        self.gate = nn.Linear(inner_dim, 1, bias=False)
+
+        self.output_proj = nn.Linear(out_dim, out_dim, bias=False)
+        # Normalization layers similar to attention blocks
+        self.pre_norm = nn.RMSNorm(out_dim, eps=1e-5)
+        self.post_proj_norm = nn.RMSNorm(out_dim, eps=1e-5)
+    
+    def _aggregate_embeddings(self, batched_inner: TT, input_mask: TT):
+        # Compute gate scores: (num_examples, max_channels, t, 1)
+        batched_scores = self.gate(batched_inner)  # (num_examples, max_channels, t, 1)
+        
+        # Lift embeddings to output dimension
+        batched_embeddings = self.lift(batched_inner)  # (num_examples, max_channels, t, out_dim)
+        batched_embeddings = batched_embeddings * (~input_mask).unsqueeze(-1).unsqueeze(-1)
+        
+        # Apply mask to scores (set padding channels to -inf before softmax)
+        batched_scores = batched_scores.squeeze(-1)  # (num_examples, max_channels, t)
+        
+        # Use torch.where instead of masked_fill to avoid CUDA graph recapture
+        # torch.where with scalar is more CUDA graph friendly than masked_fill with float('-inf')
+        mask_expanded = input_mask.unsqueeze(-1)  # (num_examples, max_channels, 1)
+        batched_scores = torch.where(mask_expanded, -torch.inf, batched_scores)
+        
+        # Permute to (num_examples, t, max_channels, 1) and apply softmax
+        batched_scores = batched_scores.permute(0, 2, 1).unsqueeze(-1)  # (num_examples, t, max_channels, 1)
+        batched_scores = torch.softmax(batched_scores, dim=2)  # (num_examples, t, max_channels, 1)
+        
+        # Permute embeddings to (num_examples, t, max_channels, out_dim) for weighted aggregation
+        batched_embeddings = batched_embeddings.permute(0, 2, 1, 3)  # (num_examples, t, max_channels, out_dim)
+        
+        # Apply pre-aggregation normalization
+        batched_embeddings = self.pre_norm(batched_embeddings)
+        
+        # Apply softmax weights: (num_examples, t, max_channels, out_dim) * (num_examples, t, max_channels, 1)
+        # Sum over channel dimension to get aggregated embeddings
+        combined_embeddings = (batched_embeddings * batched_scores).sum(dim=2)  # (num_examples, t, out_dim)
+        
+        # Apply output projection and post-projection normalization
+        combined_embeddings = self.output_proj(combined_embeddings)
+        combined_embeddings = self.post_proj_norm(combined_embeddings)
+        
+        return combined_embeddings
+
+    def forward(self, inputs: TT, input_mask: TT):
+        num_examples, max_channels = input_mask.shape
+
+        b, t, _ = inputs.shape
+        inputs = self.embeddings(inputs)
+        inputs = inputs * (~input_mask.view(-1)).unsqueeze(-1).unsqueeze(-1)
+
+        cu_s = torch.arange(0, (b + 1) * t, t, device=inputs.device)
+        x_flat = inputs.view(-1, inputs.shape[2])
+            # Pad x_flat to a multiple of 128 for kernel efficiency (same as Isotropic)
+        REQUIRED_PAD_MODULO = 128
+        original_cu_s = cu_s  # Store original for unpadding
+        if padding := (-x_flat.shape[0]) % REQUIRED_PAD_MODULO:
+            cu_s = F.pad(cu_s, (0, 1), value=padding + x_flat.shape[0])
+            x_flat = F.pad(x_flat, (0, 0, 0, padding), value=0)
+
+        # Convert cu_seqlens to seq_idx for Mamba2Simple (similar to how encoder uses it)
+        seq_idx = get_seq_idx(cu_s, x_flat.shape[0])
+        x_flat = self.mamba_embedding(x_flat[None], seq_idx=seq_idx)[0]
+
+        # Unpad before passing to cross-attention
+        if padding:
+            x_flat = x_flat[:x_flat.shape[0] - padding]
+            cu_s = original_cu_s  # Restore original cu_s
+        
+        # Build batched tensor for inner_dim: (num_examples, max_channels, t, inner_dim)
+        batched_inner = x_flat.view(num_examples, -1, t, self.inner_dim)
+        return self._aggregate_embeddings(batched_inner, input_mask)
+        
+
+
+
 class HNetTS(BlockBoundaryMixin, nn.Module):
     def __init__(self, c: HNetConfig):
         super().__init__()
         self.c = c
-        v, d = c.vocab_size, c.d_model[0]
-        self.embeddings = nn.Linear(v, d)
+        d = c.d_model[0]
+        self.embedding_type = c.embedding_type
+        embedding_config = c.embedding_config
+        if self.embedding_type == 'simple':
+            self.embeddings = nn.Linear(1, d)
+        elif self.embedding_type == 'mamba1d':
+            inner_dim = embedding_config.get('inner_dim', 32)
+            self.embeddings = Mamba1DEmbedding(inner_dim, d)
+        elif self.embedding_type == 'mamba_attention_multichannel':
+            inner_dim = embedding_config.get('inner_dim', 32)
+            self.embeddings = MambaAttentionMultichannelEmbedding(inner_dim, d)
+        elif self.embedding_type == 'gated_mamba_multichannel':
+            inner_dim = embedding_config.get('inner_dim', 32)
+            self.embeddings = GatedMambaMultichannelEmbedding(inner_dim, d)
+        else:
+            raise ValueError(f"Invalid embedding type: {self.embedding_type}")
         self.backbone = HNetEncoder(c, stage_idx=0)
 
 
-    def forward(self, inputs: TT):
-        assert inputs.is_nested and inputs.ndim == 2
+    def forward(self, inputs: TT, input_mask: TT):
+        assert inputs.ndim == 3 and inputs.shape[2] == 1, "inputs must be a 3D tensor with shape (batch_size, sequence_length, 1)"
+
+        if self.embedding_type == 'simple':
+            assert torch.all(input_mask.shape[1] == 1), "channel_mask must be all 1 for simple embedding"
+            inputs = self.embeddings(inputs)
+        else:
+            inputs = self.embeddings(inputs, input_mask)
+        
+        inputs = nested.nested_tensor(inputs, layout=torch.jagged)
         cu_s, msl = inputs.offsets(), inputs._max_seqlen
-        x_flat = self.embeddings(inputs.values().unsqueeze(-1))
+        x_flat = inputs.values()
+
         h_select, extra = self.backbone(x_flat, cu_s, msl)
         return h_select, extra
     

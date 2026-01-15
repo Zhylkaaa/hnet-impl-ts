@@ -14,3 +14,9 @@ hnet_2stage_XL.*
 
 # profiling
 chrometrace-*
+
+# wandb
+wandb/
+
+# checkpoints
+ecg-ts/

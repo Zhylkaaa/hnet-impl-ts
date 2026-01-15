@@ -42,6 +42,8 @@ class HNetConfig:
     N_compress: list[float] = field(
         default_factory=list
     )  # https://arxiv.org/pdf/2507.07955#page=8
+    embedding_type: str = 'simple'
+    embedding_config: dict = field(default_factory=dict)
 
     # NOTE: this defines the default N_compress for different hierarchies
     def __post_init__(self):
@@ -92,6 +94,30 @@ class HNetConfig:
         )
 
         return HNetConfig(arch_layout, D, d_intermediate, attn_cfg=att_cfg)
+    
+    @classmethod
+    def create_reasonable_config_ts(
+        cls, D: list[int], arch: list[str], *, d_head: int = 64, N_compress: list[float] = [], embedding_type: str = 'simple'
+    ):
+        has_mlp = [any(c.isupper() for c in s) for s in arch]
+        arch_layout = [arch[-1]]
+        for a in reversed(arch[:-1]):
+            arch_layout = [a, arch_layout, a]
+
+        assert all(d % 256 == 0 for d in D), "d_model must be divisible by 256"
+
+        def round_to(v: float, n: int = 128) -> int:
+            return round(v / n) * n
+
+        d_intermediate = [round_to(8 / 3 * d) * b for b, d in zip(has_mlp, D)]
+
+        att_cfg = AttnConfig(
+            num_heads=[d // d_head for d in D],
+            rotary_emb_dim=[d_head // 2 for d in D],
+            window_size=[1023] * (len(D) - 1) + [-1],
+        )
+
+        return HNetConfig(arch_layout, D, d_intermediate, attn_cfg=att_cfg, vocab_size=1, N_compress=N_compress, embedding_type=embedding_type)
 
 
 __all__ = ["HNetConfig"]
