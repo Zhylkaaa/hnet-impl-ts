@@ -430,7 +430,7 @@ class Mamba1DEmbedding(nn.Module):
         self.lift = nn.Linear(inner_dim, out_dim, bias=False)
 
     def forward(self, inputs: TT, input_mask: TT):
-        assert torch.all(input_mask.shape[1] == 1), "num_channels_per_example must be all 1 for mamba1d embedding"
+        assert input_mask.shape[1] == 1, "num_channels_per_example must be all 1 for mamba1d embedding"
         b, t, _ = inputs.shape
         inputs = self.embedding(inputs)
         cu_s = torch.arange(t, (b + 1) * t, t, device=inputs.device)

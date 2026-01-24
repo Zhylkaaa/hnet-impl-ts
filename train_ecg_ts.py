@@ -1,4 +1,5 @@
 import os
+import argparse
 from contextlib import nullcontext
 from typing import Tuple
 
@@ -60,7 +61,7 @@ class ECGTSModel(L.LightningModule):
         return self.model(x, input_mask)
     
     def _common_step(self, batch: Tuple[TT, TT], stage: str):
-        X, y, input_mask = batch
+        X, y, input_mask, metadata = batch
         zero = torch.tensor(0.0, device="cuda")
         with torch.autocast("cuda", torch.bfloat16):
             embeddings_flat, extras = self(X, input_mask=input_mask)
@@ -102,10 +103,12 @@ class ECGTSModel(L.LightningModule):
         weight_decay = self.hparams.weight_decay
         warmup_portion = self.hparams.warmup_portion
 
+        lambda_s = self.config.lambda_s()
+        # lambda_s[1] = (lambda_s[1] ** 2 * 1.6) ** 0.5
         opt = torch.optim.AdamW(
             [
                 dict(params=ls, lr=base_lr * lr_mod)
-                for ls, lr_mod in zip(self.model.split_params_by_hierachy(), self.config.lambda_s())
+                for ls, lr_mod in zip(self.model.split_params_by_hierachy(), lambda_s)
             ],
             betas=(0.9, 0.95),
             weight_decay=weight_decay,
@@ -141,25 +144,64 @@ def is_main_process():
 
 
 if __name__ == "__main__":
-    data_path = "/data/dz2449/ts_project/data/mimic_iv_ecg/mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0"
-    seed = 42
-    batch_size = 16
-    gradient_accumulation_steps = 2
-    num_workers = 16
-    base_lr = 5e-4
-    weight_decay = 0.01
-    num_epochs = 10
-    alpha = 0.03
-    embedding_pulling = 'mean' # 'last' or 'mean'
-    warmup_portion = 0.01
-    temperature = 0.07
-    layer_dims = [256, 512]
-    arch = ["m4", "T6"]
-    N_compress = [1, 10]
-    lr_scheduler = 'linear'
-    embedding_type = 'mamba_attention_multichannel'
-    multichannel = True
+    parser = argparse.ArgumentParser(description="Train ECG Time Series Model")
+    parser.add_argument("--data_path", type=str, 
+                        default="/data/dz2449/ts_project/data/mimic_iv_ecg/mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0",
+                        help="Path to the dataset")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, 
+                        help="Number of gradient accumulation steps")
+    parser.add_argument("--num_workers", type=int, default=16, help="Number of data loader workers")
+    parser.add_argument("--base_lr", type=float, default=5e-4, help="Base learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of training epochs")
+    parser.add_argument("--alpha", type=float, default=0.03, help="Alpha parameter for loss weighting")
+    parser.add_argument("--embedding_pulling", type=str, default='mean', choices=['last', 'mean'],
+                        help="Embedding pulling method: 'last' or 'mean'")
+    parser.add_argument("--warmup_portion", type=float, default=0.01, 
+                        help="Portion of training steps for warmup")
+    parser.add_argument("--temperature", type=float, default=0.07, help="Temperature for similarity scaling")
+    parser.add_argument("--layer_dims", type=int, nargs='+', default=[256, 512],
+                        help="Layer dimensions as space-separated integers")
+    parser.add_argument("--arch", type=str, nargs='+', default=["m4", "T6"],
+                        help="Architecture types as space-separated strings")
+    parser.add_argument("--N_compress", type=int, nargs='+', default=[1, 10],
+                        help="Compression factors as space-separated integers")
+    parser.add_argument("--lr_scheduler", type=str, default='linear', choices=['linear', 'cosine'],
+                        help="Learning rate scheduler type")
+    parser.add_argument("--embedding_type", type=str, default='mamba_attention_multichannel',
+                        help="Embedding type")
+    parser.add_argument("--multichannel", action='store_true', default=True,
+                        help="Use multichannel mode (default: True)")
+    parser.add_argument("--no_multichannel", dest='multichannel', action='store_false',
+                        help="Disable multichannel mode")
+    parser.add_argument("--randomize_leads", action='store_true', default=True,
+                        help="Randomize leads mode (default: True)")
+    parser.add_argument("--no_randomize_leads", dest='randomize_leads', action='store_false',
+                        help="Disable randomize leads mode")
     
+    args = parser.parse_args()
+    
+    data_path = args.data_path
+    seed = args.seed
+    batch_size = args.batch_size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    num_workers = args.num_workers
+    base_lr = args.base_lr
+    weight_decay = args.weight_decay
+    num_epochs = args.num_epochs
+    alpha = args.alpha
+    embedding_pulling = args.embedding_pulling
+    warmup_portion = args.warmup_portion
+    temperature = args.temperature
+    layer_dims = args.layer_dims
+    arch = args.arch
+    N_compress = args.N_compress
+    lr_scheduler = args.lr_scheduler
+    embedding_type = args.embedding_type
+    multichannel = args.multichannel
+    randomize_leads = args.randomize_leads
 
     L.seed_everything(seed, workers=True)
 
@@ -179,7 +221,7 @@ if __name__ == "__main__":
         model.embeddings.mamba_embedding = torch.compile(model.embeddings.mamba_embedding, mode="default", fullgraph=True)
         model.embeddings._aggregate_embeddings = torch.compile(model.embeddings._aggregate_embeddings, mode="reduce-overhead", dynamic=False, fullgraph=True)
 
-    datamodule = EGCDatamodule(data_path, batch_size, num_workers, multichannel=multichannel)
+    datamodule = EGCDatamodule(data_path, batch_size, num_workers, multichannel=multichannel, randomize_leads=randomize_leads)
 
     kwargs = {
         'lr': base_lr,
@@ -223,6 +265,7 @@ if __name__ == "__main__":
             embedding_type=embedding_type,
             seed=seed,
             multichannel=multichannel,
+            randomize_leads=randomize_leads,
         ))
     
     trainer = L.Trainer(

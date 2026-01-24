@@ -3,20 +3,25 @@ import random
 
 import h5py
 import numpy as np
+import scipy.io as sio
 import torch
 from torch.utils.data import Dataset, DataLoader
 
 import lightning as L
 
+import augmentations
+
 
 class ECGPretrainDataset(Dataset):
-    def __init__(self, data_path: str, multichannel: bool = False):
+    def __init__(self, data_path: str, multichannel: bool = False, randomize_leads: bool = False):
         self.data_path = data_path
         self.data = h5py.File(data_path, "r")
         self.leads = [k for k in self.data.keys() if k not in ['cum_seq_len', 'date', 'patient_id', 'study_id']]
         self.cum_seq_len = self.data["cum_seq_len"][()]
         self.multichannel = multichannel
+        self.randomize_leads = randomize_leads
         self.pad_to_max = multichannel
+        self.noise_data_mat = sio.loadmat('DATA_noises_real.mat')
 
     def __len__(self):
         return len(self.data["cum_seq_len"])
@@ -40,7 +45,7 @@ class ECGPretrainDataset(Dataset):
         ecg = self.data[lead][start_idx:end_idx]
         ecg = self.impute(ecg)
         ecg = self.normalize(ecg)
-        ecg = self.augment(ecg)
+        ecg = augmentations.ecg_positive_augmentation(ecg, lead, 500, self.noise_data_mat)
         return ecg[:, None]
     
     def impute(self, ecg: np.ndarray):
@@ -50,20 +55,24 @@ class ECGPretrainDataset(Dataset):
     def normalize(self, ecg: np.ndarray):
         return (ecg - ecg.mean()) / (ecg.std() + 1e-6)
 
-    # TODO: Implement more augmentations
-    def augment(self, ecg: np.ndarray):
-        # 50% no augmentation
-        if random.random() < 0.5:
-            ecg = ecg + np.random.normal(0, 0.01, ecg.shape)
-        return ecg
+    # # TODO: Implement more augmentations
+    # def augment(self, ecg: np.ndarray):
+    #     # 50% no augmentation
+    #     if random.random() < 0.5:
+    #         ecg = ecg + np.random.normal(0, 0.01, ecg.shape)
+    #     return ecg
 
     # Assumes uniform length
     def __getitem__(self, idx):
         start_idx = self.cum_seq_len[idx - 1] if idx > 0 else 0
         end_idx = self.cum_seq_len[idx]
         if self.multichannel:
-            k_a = random.randint(1, len(self.leads))
-            k_b = random.randint(1, len(self.leads))
+            if self.randomize_leads:
+                k_a = random.randint(1, len(self.leads))
+                k_b = random.randint(1, len(self.leads))
+            else:
+                k_a = len(self.leads)
+                k_b = len(self.leads)
         else:
             k_a = 1
             k_b = 1
@@ -84,11 +93,12 @@ class ECGPretrainDataset(Dataset):
         input_mask[0, :k_a] = False
         input_mask[1, :k_b] = False
         ecgs = np.concatenate([ecgs_a, ecgs_b], axis=0)
-        return torch.from_numpy(ecgs).float(), input_mask
+        return torch.from_numpy(ecgs).float(), input_mask, [leads_a, leads_b]
 
 
 def collate_fn(batch):
-    batch, input_mask = zip(*batch)
+    batch, input_mask, leads = zip(*batch)
+    all_leads = [example_leads for sublist in leads for example_leads in sublist]
     input_mask = torch.concatenate(input_mask, dim=0)
     batch = torch.concatenate(batch, dim=0)
 
@@ -96,20 +106,22 @@ def collate_fn(batch):
     labels = torch.zeros(N, dtype=torch.long)
     idxs = torch.arange(N, dtype=torch.long)
     labels[idxs] = idxs - (2 * (idxs % 2) - 1)
-    return batch, labels, input_mask
+    return batch, labels, input_mask, all_leads
 
 
 class EGCDatamodule(L.LightningDataModule):
-    def __init__(self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False):
+    def __init__(self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False, randomize_leads: bool = False):
         super().__init__()
         self.base_path = base_path
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.allow_zero_length_dataloader_with_multiple_devices = True
         self.multichannel = multichannel
-        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"), multichannel=self.multichannel)
-        self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel)
-        self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel)
+        self.randomize_leads = randomize_leads
+        # self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"), multichannel=self.multichannel)
+        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
+        self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
+        self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
         
         
         self.kwargs = {
