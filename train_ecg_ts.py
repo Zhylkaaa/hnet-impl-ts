@@ -164,6 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.07, help="Temperature for similarity scaling")
     parser.add_argument("--layer_dims", type=int, nargs='+', default=[256, 512],
                         help="Layer dimensions as space-separated integers")
+    parser.add_argument("--inner_dim", type=int, default=32, help="Inner dimension for embedding")
     parser.add_argument("--arch", type=str, nargs='+', default=["m4", "T6"],
                         help="Architecture types as space-separated strings")
     parser.add_argument("--N_compress", type=int, nargs='+', default=[1, 10],
@@ -196,6 +197,7 @@ if __name__ == "__main__":
     warmup_portion = args.warmup_portion
     temperature = args.temperature
     layer_dims = args.layer_dims
+    inner_dim = args.inner_dim
     arch = args.arch
     N_compress = args.N_compress
     lr_scheduler = args.lr_scheduler
@@ -206,7 +208,7 @@ if __name__ == "__main__":
     L.seed_everything(seed, workers=True)
 
     ## create model
-    config = HNetConfig.create_reasonable_config_ts(D=layer_dims, arch=arch, N_compress=N_compress, embedding_type=embedding_type)
+    config = HNetConfig.create_reasonable_config_ts(D=layer_dims, arch=arch, N_compress=N_compress, embedding_type=embedding_type, inner_dim=inner_dim)
     print(config)
     with torch.device("cuda"):
         model = HNetTS(config)
@@ -259,7 +261,7 @@ if __name__ == "__main__":
 
     for logger in loggers:
         logger.log_hyperparams(dict(
-            **kwargs, arch=arch, layer_dims=layer_dims, N_compress=N_compress, 
+            **kwargs, arch=arch, layer_dims=layer_dims, N_compress=N_compress, inner_dim=inner_dim,
             num_epochs=num_epochs, batch_size=batch_size, num_workers=num_workers, 
             gradient_accumulation_steps=gradient_accumulation_steps, 
             embedding_type=embedding_type,
