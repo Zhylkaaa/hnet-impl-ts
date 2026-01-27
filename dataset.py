@@ -3,6 +3,8 @@ import random
 
 import h5py
 import numpy as np
+import wfdb
+import pandas as pd
 import scipy.io as sio
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -142,3 +144,151 @@ class EGCDatamodule(L.LightningDataModule):
     
     # def test_dataloader(self):
     #     return DataLoader(self.test_dataset, **self.kwargs)
+
+
+def load_form_split(base_path, split_name, use_lead='II'):
+    data = pd.read_csv(os.path.join(base_path, f"ptbxl_form_{split_name}.csv"))
+    y = data.iloc[:, -19:].values.astype(int)
+    filenames = data.filename_hr
+    X = []
+    for file in filenames:
+        signal, meta = wfdb.rdsamp(os.path.join(base_path, file))
+        if use_lead:
+            lead_id = meta['sig_name'].index(use_lead)
+            X.append(signal[:, lead_id:lead_id+1].T)
+        else:
+            X.append(signal.T)
+    return np.array(X), y
+
+def load_rhythm_split(base_path, split_name, use_lead='II'):
+    data = pd.read_csv(os.path.join(base_path, f"ptbxl_rhythm_{split_name}.csv"))
+    y = data.iloc[:, -12:].values.astype(int)
+    filenames = data.filename_hr
+    X = []
+    for file in filenames:
+        signal, meta = wfdb.rdsamp(os.path.join(base_path, file))
+        if use_lead:
+            lead_id = meta['sig_name'].index(use_lead)
+            X.append(signal[:, lead_id:lead_id+1].T)
+        else:
+            X.append(signal.T)
+    return np.array(X), y
+
+def load_diagnostic_split(base_path, split_name, use_lead='II'):
+    data = pd.read_csv(os.path.join(base_path, f"ptbxl_diagnostic_{split_name}.csv"))
+    y = data.iloc[:, -44:].values.astype(int)
+    filenames = data.filename_hr
+    X = []
+    for file in filenames:
+        signal, meta = wfdb.rdsamp(os.path.join(base_path, file))
+        if use_lead:
+            lead_id = meta['sig_name'].index(use_lead)
+            X.append(signal[:, lead_id:lead_id+1].T)
+        else:
+            X.append(signal.T)
+    return np.array(X), y
+
+def load_subdiagnostic_split(base_path, split_name, use_lead='II'):
+    data = pd.read_csv(os.path.join(base_path, f"ptbxl_subdiagnostic_{split_name}.csv"))
+    y = data.iloc[:, -23:].values.astype(int)
+    filenames = data.filename_hr
+    X = []
+    for file in filenames:
+        signal, meta = wfdb.rdsamp(os.path.join(base_path, file))
+        if use_lead:
+            lead_id = meta['sig_name'].index(use_lead)
+            X.append(signal[:, lead_id:lead_id+1].T)
+        else:
+            X.append(signal.T)
+    return np.array(X), y
+
+def load_supdiagnostic_split(base_path, split_name, use_lead='II'):
+    data = pd.read_csv(os.path.join(base_path, f"ptbxl_supdiagnostic_{split_name}.csv"))
+    y = data.iloc[:, -5:].values.astype(int)
+    filenames = data.filename_hr
+    X = []
+    for file in filenames:
+        signal, meta = wfdb.rdsamp(os.path.join(base_path, file))
+        if use_lead:
+            lead_id = meta['sig_name'].index(use_lead)
+            X.append(signal[:, lead_id:lead_id+1].T)
+        else:
+            X.append(signal.T)
+    return np.array(X), y
+
+# Define all subsets and their loading functions
+SUBSETS = {
+    'form': load_form_split,
+    'rhythm': load_rhythm_split,
+    'diagnostic': load_diagnostic_split,
+    'subdiagnostic': load_subdiagnostic_split,
+    'supdiagnostic': load_supdiagnostic_split
+}
+
+
+class PTBXLEGCDataset(Dataset):
+    def __init__(self, base_path: str, subset: str, split: str, use_lead: str = 'II'):
+        self.base_path = base_path
+        self.subset = subset
+        self.split = split
+        self.use_lead = use_lead
+        print("Loading PTB-XL ECG dataset...")
+        self.data, self.labels = SUBSETS[self.subset](self.base_path, self.split, self.use_lead if self.use_lead != 'all' else None)
+        print("Loaded PTB-XL ECG dataset")
+
+    def __len__(self):
+        return len(self.data)
+    
+    def impute(self, ecg: np.ndarray):
+        ecg[np.isnan(ecg)] = 0
+        return ecg
+
+    def normalize(self, ecg: np.ndarray):
+        return (ecg - ecg.mean(axis=1, keepdims=True)) / (ecg.std(axis=1, keepdims=True) + 1e-6)
+
+    # Assumes uniform length
+    def __getitem__(self, idx):
+        ecg = self.data[idx]
+        ecg = self.impute(ecg)
+        ecg = self.normalize(ecg)
+        return torch.from_numpy(ecg).float().unsqueeze(-1), torch.from_numpy(self.labels[idx]).float()
+
+
+def collate_ptbxl_fn(batch):
+    batch, labels = zip(*batch)
+    batch = torch.stack(batch, dim=0)
+    labels = torch.stack(labels, dim=0)
+    return batch, labels
+
+
+class PTBXLEGCDatamodule(L.LightningDataModule):
+    def __init__(self, base_path: str, subset: str, batch_size: int, num_workers: int, use_lead: str = 'II'):
+        super().__init__()
+        self.base_path = base_path
+        self.subset = subset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.use_lead = use_lead
+        self.train_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='train', use_lead=self.use_lead)
+        self.val_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='val', use_lead=self.use_lead)
+        self.test_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='test', use_lead=self.use_lead)
+        
+        
+        self.kwargs = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "multiprocessing_context": "spawn" if self.num_workers > 0 else None,
+            "collate_fn": collate_ptbxl_fn,
+            'persistent_workers': self.num_workers > 0,
+            'pin_memory': True,
+            'prefetch_factor': 21,
+        }
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, **self.kwargs, shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, **self.kwargs)
+    
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, **self.kwargs)
