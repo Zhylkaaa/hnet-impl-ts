@@ -171,13 +171,15 @@ def zero_masking(ecg_signal, mask_ratio=0.1):
     mask_length = int(n_samples * mask_ratio)
     start_idx = random.randint(0, n_samples - mask_length)
     masked_signal = ecg_signal.copy()
-
+    noise_mask = np.zeros_like(ecg_signal)
     if ecg_signal.ndim != 1:
         masked_signal[:, start_idx : start_idx + mask_length] = 0
+        noise_mask[:, start_idx : start_idx + mask_length] = 1
     else:
         masked_signal[start_idx : start_idx + mask_length] = 0
+        noise_mask[start_idx : start_idx + mask_length] = 1
 
-    return masked_signal
+    return masked_signal, noise_mask
 
 
 ############### ECG-Specific Augmentations ###############
@@ -205,6 +207,6 @@ def ecg_positive_augmentation(
     aug_signal = aug_func(ecg_signal, noise_mat, sampling_rate, channel_name)
 
     if p > 0 and random.random() < p:
-        aug_signal = zero_masking(aug_signal, mask_ratio=random.uniform(0.1, 0.3))
+        aug_signal, _ = zero_masking(aug_signal, mask_ratio=random.uniform(0.1, 0.3))
 
     return _match_shape(aug_signal, ecg_signal)

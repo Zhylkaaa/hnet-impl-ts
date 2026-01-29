@@ -44,6 +44,7 @@ class HNetConfig:
     )  # https://arxiv.org/pdf/2507.07955#page=8
     embedding_type: str = 'simple'
     embedding_config: dict = field(default_factory=dict)
+    use_decoder: bool = False
 
     # NOTE: this defines the default N_compress for different hierarchies
     def __post_init__(self):
@@ -97,7 +98,7 @@ class HNetConfig:
     
     @classmethod
     def create_reasonable_config_ts(
-        cls, D: list[int], arch: list[str], *, d_head: int = 64, N_compress: list[float] = [], embedding_type: str = 'simple', inner_dim: int = 32
+        cls, D: list[int], arch: list[str], *, d_head: int = 64, N_compress: list[float] = [], embedding_type: str = 'simple', inner_dim: int = 32, use_decoder: bool = False
     ):
         has_mlp = [any(c.isupper() for c in s) for s in arch]
         arch_layout = [arch[-1]]
@@ -117,7 +118,7 @@ class HNetConfig:
             window_size=[1023] * (len(D) - 1) + [-1],
         )
 
-        return HNetConfig(arch_layout, D, d_intermediate, attn_cfg=att_cfg, vocab_size=1, N_compress=N_compress, embedding_type=embedding_type, embedding_config={'inner_dim': inner_dim})
+        return HNetConfig(arch_layout, D, d_intermediate, attn_cfg=att_cfg, vocab_size=1, N_compress=N_compress, embedding_type=embedding_type, embedding_config={'inner_dim': inner_dim}, use_decoder=use_decoder)
 
 
 __all__ = ["HNetConfig"]

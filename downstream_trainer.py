@@ -129,10 +129,11 @@ class ECGTSModel(L.LightningModule):
 
         # lambda_s[1] = (lambda_s[1] ** 2 * 1.6) ** 0.5
         opt = torch.optim.AdamW(
-            self.projection_head.parameters(),
+            [
+                dict(params=self.projection_head.parameters(), lr=base_lr)
+            ],
             betas=(0.9, 0.95),
-            weight_decay=weight_decay,
-            lr=base_lr,
+            weight_decay=weight_decay
         )
         scheduler_kwargs = {}
         if self.hparams.lr_scheduler == 'linear':
@@ -215,15 +216,13 @@ if __name__ == "__main__":
     ## create model
     ckpt = torch.load(pretrained_model_path, weights_only=False)
     config = ckpt['hyper_parameters']['config']
-    with torch.device("cuda"):
-        model = HNetTS(config)
-    model.backbone.block_compile(ac=False)
     print(config)
     with torch.device("cuda"):
         model = HNetTS(config)
-    print(model)
     model.backbone.block_compile(ac=False)
+    print(model)
 
+    model.use_decoder = False  # always false for downstream
     embedding_type = config.embedding_type
 
     if embedding_type == 'mamba_attention_multichannel':
@@ -290,6 +289,7 @@ if __name__ == "__main__":
         callbacks=[
             ModelCheckpoint(monitor="val_loss_epoch", mode="min", save_top_k=1, save_last=True),
             LearningRateMonitor(),
+            EarlyStopping(monitor="val_loss_epoch", mode="min", patience=10, min_delta=0.0001),
         ],
         logger=loggers,
     )

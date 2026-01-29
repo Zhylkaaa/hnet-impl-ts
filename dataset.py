@@ -15,7 +15,7 @@ import augmentations
 
 
 class ECGPretrainDataset(Dataset):
-    def __init__(self, data_path: str, multichannel: bool = False, randomize_leads: bool = False):
+    def __init__(self, data_path: str, multichannel: bool = False, randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3)):
         self.data_path = data_path
         self.data = h5py.File(data_path, "r")
         self.leads = [k for k in self.data.keys() if k not in ['cum_seq_len', 'date', 'patient_id', 'study_id']]
@@ -24,6 +24,8 @@ class ECGPretrainDataset(Dataset):
         self.randomize_leads = randomize_leads
         self.pad_to_max = multichannel
         self.noise_data_mat = sio.loadmat('DATA_noises_real.mat')
+        self.mask_probability = mask_probability
+        self.mask_range = mask_range
 
     def __len__(self):
         return len(self.data["cum_seq_len"])
@@ -46,9 +48,15 @@ class ECGPretrainDataset(Dataset):
     def _process_ecg(self, lead: str, start_idx: int, end_idx: int):
         ecg = self.data[lead][start_idx:end_idx]
         ecg = self.impute(ecg)
+        ecg = augmentations.ecg_positive_augmentation(ecg, lead, 500, self.noise_data_mat, p=0)
         ecg = self.normalize(ecg)
-        ecg = augmentations.ecg_positive_augmentation(ecg, lead, 500, self.noise_data_mat)
-        return ecg[:, None]
+        if random.random() < self.mask_probability:
+            ecg_masked, noise_mask = augmentations.zero_masking(ecg, mask_ratio=random.uniform(*self.mask_range))
+            noise_mask[noise_mask == 1] = ecg[noise_mask == 1]
+            ecg = ecg_masked
+        else:
+            noise_mask = np.zeros_like(ecg)
+        return ecg[:, None], noise_mask[:, None]
     
     def impute(self, ecg: np.ndarray):
         ecg[np.isnan(ecg)] = 0
@@ -80,39 +88,43 @@ class ECGPretrainDataset(Dataset):
             k_b = 1
         leads_a = random.sample(self.leads, k_a)
         leads_b = random.sample(self.leads, k_b)
-        ecgs_a = [self._process_ecg(lead, start_idx, end_idx) for lead in leads_a]
-        ecgs_b = [self._process_ecg(lead, start_idx, end_idx) for lead in leads_b]
+        ecgs_a, noise_masks_a = zip(*[self._process_ecg(lead, start_idx, end_idx) for lead in leads_a])
+        ecgs_b, noise_masks_b = zip(*[self._process_ecg(lead, start_idx, end_idx) for lead in leads_b])
         
         ecgs_a = np.stack(ecgs_a, axis=0)
         if self.pad_to_max and k_a < len(self.leads):
             ecgs_a = np.concatenate([ecgs_a, np.zeros((len(self.leads) - k_a, ecgs_a.shape[1], 1))], axis=0)
-        
+            noise_masks_a = np.concatenate([noise_masks_a, np.zeros((len(self.leads) - k_a, noise_masks_a.shape[1], 1))], axis=0)
         ecgs_b = np.stack(ecgs_b, axis=0)
         if self.pad_to_max and k_b < len(self.leads):
             ecgs_b = np.concatenate([ecgs_b, np.zeros((len(self.leads) - k_b, ecgs_b.shape[1], 1))], axis=0)
-
+            noise_masks_b = np.concatenate([noise_masks_b, np.zeros((len(self.leads) - k_b, noise_masks_b.shape[1], 1))], axis=0)
         input_mask = torch.ones(2, len(self.leads) if self.pad_to_max else max(k_a, k_b), dtype=torch.bool)
         input_mask[0, :k_a] = False
         input_mask[1, :k_b] = False
         ecgs = np.concatenate([ecgs_a, ecgs_b], axis=0)
-        return torch.from_numpy(ecgs).float(), input_mask, [leads_a, leads_b]
+        noise_masks = np.concatenate([noise_masks_a, noise_masks_b], axis=0)
+        return torch.from_numpy(ecgs).float(), input_mask, [leads_a, leads_b], torch.from_numpy(noise_masks).float()
 
 
 def collate_fn(batch):
-    batch, input_mask, leads = zip(*batch)
+    batch, input_mask, leads, noise_masks = zip(*batch)
     all_leads = [example_leads for sublist in leads for example_leads in sublist]
     input_mask = torch.concatenate(input_mask, dim=0)
     batch = torch.concatenate(batch, dim=0)
-
+    noise_masks = torch.concatenate(noise_masks, dim=0)
     N = input_mask.shape[0]
     labels = torch.zeros(N, dtype=torch.long)
     idxs = torch.arange(N, dtype=torch.long)
     labels[idxs] = idxs - (2 * (idxs % 2) - 1)
-    return batch, labels, input_mask, all_leads
+    return batch, labels, input_mask, all_leads, noise_masks
 
 
 class EGCDatamodule(L.LightningDataModule):
-    def __init__(self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False, randomize_leads: bool = False):
+    def __init__(
+        self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False, 
+        randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3)
+    ):
         super().__init__()
         self.base_path = base_path
         self.batch_size = batch_size
@@ -121,9 +133,9 @@ class EGCDatamodule(L.LightningDataModule):
         self.multichannel = multichannel
         self.randomize_leads = randomize_leads
         # self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"), multichannel=self.multichannel)
-        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
-        self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
-        self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads)
+        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
+        # self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
+        # self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
         
         
         self.kwargs = {
@@ -281,7 +293,7 @@ class PTBXLEGCDatamodule(L.LightningDataModule):
             "collate_fn": collate_ptbxl_fn,
             'persistent_workers': self.num_workers > 0,
             'pin_memory': True,
-            'prefetch_factor': 21,
+            'prefetch_factor': 2,
         }
 
     def train_dataloader(self):

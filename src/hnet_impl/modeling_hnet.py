@@ -296,11 +296,14 @@ class HNetEncoder(nn.Module):
     
     Note: The outputs are at the compressed/selected sequence length (select_cu), not the
     original input sequence length, since we skip the dechunking step.
+    
+    When use_decoder=True, it also returns decoder outputs for masked prediction tasks.
     """
     def __init__(self, c: HNetConfig, stage_idx: int):
         super().__init__()
         self.stage_idx = stage_idx
         self.d = c.d_model[stage_idx]
+        self.use_decoder = c.use_decoder
         try:
             self.n = c.N_compress[stage_idx + 1] / c.N_compress[stage_idx]
         except IndexError:
@@ -320,9 +323,14 @@ class HNetEncoder(nn.Module):
         else:
             self.encoder = Isotropic(c, arch_layout[0], stage_idx=stage_idx)
             self.main_network = HNetEncoder(c, stage_idx + 1)  # Use HNetEncoder recursively
-            # NO decoder module
-
+            
             self.routing_module = RoutingModule(self.d)
+            
+            # Conditionally initialize decoder components for masked prediction
+            if self.use_decoder:
+                self.decoder = Isotropic(c, arch_layout[2], stage_idx=stage_idx)
+                self.dechunk_layer = DeChunkLayer(self.d)
+                self.residual_proj = HighPrecLinear(self.d, self.d)
 
         d_gain = self.d - c.d_model[stage_idx - 1] if stage_idx else None
         self.pad_dimension = (
@@ -335,7 +343,12 @@ class HNetEncoder(nn.Module):
         if self.is_innermost:
             return
         self.encoder.block_compile(ac)
-        # NO decoder to compile
+        if self.use_decoder:
+            self.decoder.block_compile(ac)
+            self.register_module(
+                "residual_proj",
+                torch.compile(self.residual_proj, backend="inductor", fullgraph=True),
+            )
         self.register_module(
             "routing_module",
             torch.compile(self.routing_module, backend="inductor", fullgraph=True),
@@ -388,7 +401,9 @@ class HNetEncoder(nn.Module):
 
         if self.is_innermost:
             # For innermost, just return main_network output
-            return self.main_network(x_flat, flat_cu, msl)[..., :d_orig], []
+            # Note: innermost stage has no decoder architecture (arch_layout length is 1)
+            h_select = self.main_network(x_flat, flat_cu, msl)[..., :d_orig]
+            return h_select, []
 
         r_flat = self.encoder(x_flat, flat_cu, msl)
         p_flat, b_flat, select_cu = self.routing_module(r_flat, flat_cu)
@@ -402,14 +417,25 @@ class HNetEncoder(nn.Module):
             ratio_loss = (
                 self.ratio_loss(b_flat, p_flat) if torch.is_grad_enabled() else 0
             )
+            if self.use_decoder:
+                c_flat = torch.where(b_flat, p_flat, 1 - p_flat)[..., None]
+                residual = self.residual_proj(r_flat)
         p_select, r_select = pending_selected_tensors
 
         
-        h_select, extras = self.main_network(
+        main_network_output = self.main_network(
             r_select, select_cu, pending_cpu_stats[0].item()
         )
+        
+        # Handle recursive HNetEncoder output: may return tuple if decoder is enabled at deeper stage
+        # We only need h_select for processing at this stage, decoder outputs from deeper stages are not used here
+        if isinstance(main_network_output[0], tuple):
+            h_select, _ = main_network_output[0]  # Extract h_select from tuple
+            extras = main_network_output[1]
+        else:
+            h_select, extras = main_network_output
 
-        # Return raw main_network outputs without dechunking or residual addition
+        # Return raw main_network outputs for similarity pretraining
         # Note: h_select is at compressed sequence length (select_cu), not original length
         # h_select dimension matches the next stage's d_model, not d_orig
 
@@ -418,6 +444,15 @@ class HNetEncoder(nn.Module):
             ratio_loss,
             p_select.numel() / p_flat.numel(),
         )
+
+        # If decoder is enabled, also compute decoder outputs for masked prediction
+        if self.use_decoder:
+            x_flat_dec = self.dechunk_layer(
+                h_select, b_flat, p_select, get_seq_idx(select_cu, p_select.shape[0])
+            )
+            x_flat_dec = (residual + x_flat_dec.float() * ste_func(c_flat)).type_as(x_flat_dec)
+            decoder_output = self.decoder(x_flat_dec, flat_cu, msl)[..., :d_orig]
+            return (h_select, decoder_output), [extra] + extras
 
         return h_select, [extra] + extras
 
@@ -643,6 +678,8 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
         else:
             raise ValueError(f"Invalid embedding type: {self.embedding_type}")
         self.backbone = HNetEncoder(c, stage_idx=0)
+        if self.c.use_decoder:
+            self.ts_head = nn.Linear(d, 1)
 
 
     def forward(self, inputs: TT, input_mask: TT):
@@ -658,8 +695,16 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
         cu_s, msl = inputs.offsets(), inputs._max_seqlen
         x_flat = inputs.values()
 
-        h_select, extra = self.backbone(x_flat, cu_s, msl)
-        return h_select, extra
+        backbone_output = self.backbone(x_flat, cu_s, msl)
+        # Handle both cases: with decoder (returns tuple) and without decoder (returns single tensor)
+        if self.c.use_decoder:
+            h_select, decoder_output = backbone_output[0]
+            decoder_output = self.ts_head(decoder_output)
+            extra = backbone_output[1]
+            return (h_select, decoder_output), extra
+        else:
+            h_select, extra = backbone_output
+            return h_select, extra
     
     def split_params_by_hierachy(self) -> list[list[nn.Parameter]]:
         # for each param, count the number of times ".main_network" appears in it.

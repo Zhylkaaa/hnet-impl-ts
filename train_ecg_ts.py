@@ -48,6 +48,8 @@ class ECGTSModel(L.LightningModule):
                  warmup_portion: float, 
                  embedding_pulling: str = 'mean', 
                  alpha: float = 0.03,
+                 lambda_reconstruction: float = 0.1,
+                 lambda_similarity: float = 1.0,
                  temperature: float = 0.07,
                  lr_scheduler: str = 'linear',
                  **kwargs):
@@ -56,15 +58,28 @@ class ECGTSModel(L.LightningModule):
         self.model = model
         self.save_hyperparameters(ignore=["model"])
         self.loss_fn = nn.CrossEntropyLoss()
+        if self.config.use_decoder:
+            self.reconstruction_loss_fn = nn.MSELoss()
+        else:
+            self.reconstruction_loss_fn = None
 
     def forward(self, x: TT, input_mask: TT):
         return self.model(x, input_mask)
     
     def _common_step(self, batch: Tuple[TT, TT], stage: str):
-        X, y, input_mask, metadata = batch
+        X, y, input_mask, metadata, noise_masks = batch
         zero = torch.tensor(0.0, device="cuda")
         with torch.autocast("cuda", torch.bfloat16):
             embeddings_flat, extras = self(X, input_mask=input_mask)
+            if self.config.use_decoder:
+                embeddings_flat, decoder_output = embeddings_flat
+                mask = noise_masks != 0
+                if mask.sum() == 0:
+                    reconstruction_loss = 0.0
+                else:
+                    reconstruction_loss = self.reconstruction_loss_fn(decoder_output[mask.view(-1, 1)], noise_masks[mask])
+            else:
+                reconstruction_loss = 0.0
             embeddings_idx_flat = extras[0].b.values().reshape(input_mask.shape[0], X.shape[1]).sum(dim=1)
             embeddings_idx = torch.cumsum(embeddings_idx_flat, dim=0)
             if self.hparams.embedding_pulling == 'last':
@@ -81,12 +96,14 @@ class ECGTSModel(L.LightningModule):
             sim_loss = self.loss_fn(similarities, y)
 
             l_ratio = sum([e.loss_ratio for e in extras], zero)
-            loss = sim_loss + self.hparams.alpha * l_ratio
+            loss = self.hparams.lambda_similarity * sim_loss + self.hparams.alpha * l_ratio + self.hparams.lambda_reconstruction * reconstruction_loss
             batch_size = input_mask.shape[0]
             self.log(f"{stage}_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
             self.log(f"{stage}_sim_loss", sim_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size)
             self.log(f"{stage}_l_ratio", l_ratio, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size)
             self.log(f"{stage}_sparsity", embeddings_idx_flat.float().mean().item(), on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+            if self.config.use_decoder:
+                self.log(f"{stage}_reconstruction_loss", reconstruction_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size)
             return loss
     
     def training_step(self, batch: Tuple[TT, TT]):
@@ -181,7 +198,14 @@ if __name__ == "__main__":
                         help="Randomize leads mode (default: True)")
     parser.add_argument("--no_randomize_leads", dest='randomize_leads', action='store_false',
                         help="Disable randomize leads mode")
-    
+    parser.add_argument("--use_decoder", action='store_true', default=False,
+                        help="Use decoder mode (default: False)")
+    parser.add_argument("--mask_probability", type=float, default=0.2,
+                        help="Mask probability for zero masking")
+    parser.add_argument("--mask_range", type=float, default=[0.05, 0.1], nargs='+',
+                        help="Range for mask probability for zero masking")
+    parser.add_argument("--lambda_reconstruction", type=float, default=0.1,
+                        help="Lambda for reconstruction loss")
     args = parser.parse_args()
     
     data_path = args.data_path
@@ -204,11 +228,16 @@ if __name__ == "__main__":
     embedding_type = args.embedding_type
     multichannel = args.multichannel
     randomize_leads = args.randomize_leads
-
+    use_decoder = args.use_decoder
+    mask_probability = args.mask_probability
+    mask_range = args.mask_range
+    lambda_reconstruction = args.lambda_reconstruction
     L.seed_everything(seed, workers=True)
 
     ## create model
-    config = HNetConfig.create_reasonable_config_ts(D=layer_dims, arch=arch, N_compress=N_compress, embedding_type=embedding_type, inner_dim=inner_dim)
+    config = HNetConfig.create_reasonable_config_ts(
+        D=layer_dims, arch=arch, N_compress=N_compress, 
+        embedding_type=embedding_type, inner_dim=inner_dim, use_decoder=use_decoder)
     print(config)
     with torch.device("cuda"):
         model = HNetTS(config)
@@ -223,7 +252,10 @@ if __name__ == "__main__":
         model.embeddings.mamba_embedding = torch.compile(model.embeddings.mamba_embedding, mode="default", fullgraph=True)
         model.embeddings._aggregate_embeddings = torch.compile(model.embeddings._aggregate_embeddings, mode="reduce-overhead", dynamic=False, fullgraph=True)
 
-    datamodule = EGCDatamodule(data_path, batch_size, num_workers, multichannel=multichannel, randomize_leads=randomize_leads)
+    datamodule = EGCDatamodule(
+        data_path, batch_size, num_workers, multichannel=multichannel, 
+        randomize_leads=randomize_leads, mask_probability=mask_probability, mask_range=mask_range
+    )
 
     kwargs = {
         'lr': base_lr,
@@ -233,6 +265,7 @@ if __name__ == "__main__":
         'warmup_portion': warmup_portion,
         'temperature': temperature,
         'lr_scheduler': lr_scheduler,
+        'lambda_reconstruction': lambda_reconstruction,
     }
     model = ECGTSModel(config, model, **kwargs)
 
@@ -268,6 +301,7 @@ if __name__ == "__main__":
             seed=seed,
             multichannel=multichannel,
             randomize_leads=randomize_leads,
+            use_decoder=use_decoder,
         ))
     
     trainer = L.Trainer(
