@@ -206,6 +206,8 @@ if __name__ == "__main__":
                         help="Range for mask probability for zero masking")
     parser.add_argument("--lambda_reconstruction", type=float, default=0.1,
                         help="Lambda for reconstruction loss")
+    parser.add_argument("--lambda_similarity", type=float, default=1.0,
+                        help="Lambda for similarity loss")
     args = parser.parse_args()
     
     data_path = args.data_path
