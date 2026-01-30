@@ -222,6 +222,7 @@ if __name__ == "__main__":
     model.backbone.block_compile(ac=False)
     print(model)
 
+    model.backbone.use_decoder = False  # always false for downstream
     model.use_decoder = False  # always false for downstream
     embedding_type = config.embedding_type
 

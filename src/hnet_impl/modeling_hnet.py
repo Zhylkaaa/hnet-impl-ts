@@ -661,6 +661,7 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
     def __init__(self, c: HNetConfig):
         super().__init__()
         self.c = c
+        self.use_decoder = c.use_decoder
         d = c.d_model[0]
         self.embedding_type = c.embedding_type
         embedding_config = c.embedding_config
@@ -697,7 +698,7 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
 
         backbone_output = self.backbone(x_flat, cu_s, msl)
         # Handle both cases: with decoder (returns tuple) and without decoder (returns single tensor)
-        if self.c.use_decoder:
+        if self.use_decoder:
             h_select, decoder_output = backbone_output[0]
             decoder_output = self.ts_head(decoder_output)
             extra = backbone_output[1]
