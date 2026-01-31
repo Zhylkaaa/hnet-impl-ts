@@ -211,7 +211,7 @@ if __name__ == "__main__":
                         help="Embedding pulling method: 'last' or 'mean'")
     parser.add_argument("--warmup_portion", type=float, default=0.01, 
                         help="Portion of training steps for warmup")
-    parser.add_argument("--", type=str, default='linear', choices=['linear', 'cosine', 'plateau'],
+    parser.add_argument("--lr_scheduler", type=str, default='linear', choices=['linear', 'cosine', 'plateau'],
                         help="Learning rate scheduler type")
     parser.add_argument("--full_finetune", action='store_true', help="Full finetune the model")
     parser.add_argument("--monitor_metric", type=str, default='val_auroc_epoch', choices=['val_auroc_epoch', 'val_loss_epoch'],
