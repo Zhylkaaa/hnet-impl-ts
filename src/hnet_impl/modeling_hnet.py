@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
@@ -299,11 +299,12 @@ class HNetEncoder(nn.Module):
     
     When use_decoder=True, it also returns decoder outputs for masked prediction tasks.
     """
-    def __init__(self, c: HNetConfig, stage_idx: int):
+    def __init__(self, c: HNetConfig, stage_idx: int, finetune_mode: bool = False):
         super().__init__()
         self.stage_idx = stage_idx
         self.d = c.d_model[stage_idx]
         self.use_decoder = c.use_decoder
+        self.finetune_mode = finetune_mode
         try:
             self.n = c.N_compress[stage_idx + 1] / c.N_compress[stage_idx]
         except IndexError:
@@ -404,8 +405,9 @@ class HNetEncoder(nn.Module):
             # Note: innermost stage has no decoder architecture (arch_layout length is 1)
             h_select = self.main_network(x_flat, flat_cu, msl)[..., :d_orig]
             return h_select, []
-
-        r_flat = self.encoder(x_flat, flat_cu, msl)
+        
+        with torch.inference_mode() if self.finetune_mode else nullcontext():
+            r_flat = self.encoder(x_flat, flat_cu, msl)
         p_flat, b_flat, select_cu = self.routing_module(r_flat, flat_cu)
 
         # obtaining r_select/p_select would require a cpu-sync'ing .masked_select in normal circumstances.
@@ -658,7 +660,7 @@ class GatedMambaMultichannelEmbedding(nn.Module):
 
 
 class HNetTS(BlockBoundaryMixin, nn.Module):
-    def __init__(self, c: HNetConfig):
+    def __init__(self, c: HNetConfig, finetune_mode: bool = False):
         super().__init__()
         self.c = c
         self.use_decoder = c.use_decoder
@@ -678,23 +680,25 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
             self.embeddings = GatedMambaMultichannelEmbedding(inner_dim, d)
         else:
             raise ValueError(f"Invalid embedding type: {self.embedding_type}")
-        self.backbone = HNetEncoder(c, stage_idx=0)
+        self.backbone = HNetEncoder(c, stage_idx=0, finetune_mode=finetune_mode)
         if self.c.use_decoder:
             self.ts_head = nn.Linear(d, 1)
+        self.finetune_mode = finetune_mode
 
 
     def forward(self, inputs: TT, input_mask: TT):
         assert inputs.ndim == 3 and inputs.shape[2] == 1, "inputs must be a 3D tensor with shape (batch_size, sequence_length, 1)"
 
-        if self.embedding_type == 'simple':
-            assert torch.all(input_mask.shape[1] == 1), "channel_mask must be all 1 for simple embedding"
-            inputs = self.embeddings(inputs)
-        else:
-            inputs = self.embeddings(inputs, input_mask)
-        
-        inputs = nested.nested_tensor(inputs, layout=torch.jagged)
-        cu_s, msl = inputs.offsets(), inputs._max_seqlen
-        x_flat = inputs.values()
+        with torch.inference_mode() if self.finetune_mode else nullcontext:
+            if self.embedding_type == 'simple':
+                assert torch.all(input_mask.shape[1] == 1), "channel_mask must be all 1 for simple embedding"
+                inputs = self.embeddings(inputs)
+            else:
+                inputs = self.embeddings(inputs, input_mask)
+            
+            inputs = nested.nested_tensor(inputs, layout=torch.jagged)
+            cu_s, msl = inputs.offsets(), inputs._max_seqlen
+            x_flat = inputs.values()
 
         backbone_output = self.backbone(x_flat, cu_s, msl)
         # Handle both cases: with decoder (returns tuple) and without decoder (returns single tensor)

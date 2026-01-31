@@ -19,6 +19,9 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from torchmetrics.classification import MultilabelAUROC, MultilabelAccuracy
 
 
+torch._dynamo.config.recompile_limit = 1000
+
+
 class LinearWarmupDecayLR(LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
         self.num_warmup_steps = num_warmup_steps
@@ -50,15 +53,16 @@ class ECGTSModel(L.LightningModule):
                  warmup_portion: float, 
                  embedding_pulling: str = 'mean', 
                  lr_scheduler: str = 'linear',
+                 full_finetune: bool = False,
                  **kwargs):
         super().__init__()
         self.embedding_model = embedding_model
-        self.embedding_model.requires_grad_(False)
         self.embedding_dim = embedding_dim
         self.projection_head = nn.Linear(embedding_dim, num_classes)
         self.embedding_pulling = embedding_pulling
         self.save_hyperparameters(ignore=["embedding_model"])
         self.loss_fn = nn.BCEWithLogitsLoss()
+        self.context = torch.inference_mode if not full_finetune else nullcontext
         
         # Initialize metrics for each stage
         self.train_metrics = {
@@ -83,7 +87,7 @@ class ECGTSModel(L.LightningModule):
                 self.register_module(f"{stage}_{name}", metric)
 
     def forward(self, inputs: TT):
-        with torch.inference_mode():
+        with self.context():
             num_examples, num_channels, T, _ = inputs.shape
             inputs = inputs.reshape(num_examples * num_channels, T, 1)
             input_mask = torch.zeros(num_examples, num_channels, dtype=torch.bool, device=inputs.device)
@@ -128,10 +132,15 @@ class ECGTSModel(L.LightningModule):
         warmup_portion = self.hparams.warmup_portion
 
         # lambda_s[1] = (lambda_s[1] ** 2 * 1.6) ** 0.5
+        params = [
+            dict(params=params, lr=base_lr)
+            for name, params in self.named_parameters()
+            # exclude metrics and modules with no grad
+            if params.requires_grad and not any(name.startswith(prefix) for prefix in ['train_', 'val_', 'test_'])
+        ]
+
         opt = torch.optim.AdamW(
-            [
-                dict(params=self.projection_head.parameters(), lr=base_lr)
-            ],
+            params,
             betas=(0.9, 0.95),
             weight_decay=weight_decay
         )
@@ -197,6 +206,9 @@ if __name__ == "__main__":
                         help="Portion of training steps for warmup")
     parser.add_argument("--lr_scheduler", type=str, default='linear', choices=['linear', 'cosine'],
                         help="Learning rate scheduler type")
+    parser.add_argument("--full_finetune", action='store_true', help="Full finetune the model")
+    parser.add_argument("--monitor_metric", type=str, default='val_auroc_epoch', choices=['val_auroc_epoch', 'val_loss_epoch'],
+                        help="Metric to monitor for early stopping and checkpointing")
     args = parser.parse_args()
     
     data_path = args.data_path
@@ -218,7 +230,7 @@ if __name__ == "__main__":
     config = ckpt['hyper_parameters']['config']
     print(config)
     with torch.device("cuda"):
-        model = HNetTS(config)
+        model = HNetTS(config, finetune_mode=args.full_finetune)
     model.backbone.block_compile(ac=False)
     print(model)
 
@@ -234,6 +246,17 @@ if __name__ == "__main__":
     
     model.load_state_dict({k.replace('model.', ''): v for k, v in ckpt['state_dict'].items() if k.startswith('model.')}, strict=True)
 
+    if args.full_finetune:
+        model.embeddings.requires_grad_(False)
+        model.backbone.requires_grad_(False)
+        # Only finetune attention stack
+        model.backbone.main_network.requires_grad_(True)
+        if config.use_decoder:
+            model.ts_head.requires_grad_(False)
+    else:
+        model.requires_grad_(False)
+
+    
     datamodule = PTBXLEGCDatamodule(data_path, args.subset, batch_size, num_workers, use_lead='all' if embedding_type.endswith('multichannel') else 'II')
 
     kwargs = {
@@ -242,6 +265,7 @@ if __name__ == "__main__":
         'embedding_pulling': embedding_pulling, # 'last' or 'mean'
         'warmup_portion': warmup_portion,
         'lr_scheduler': lr_scheduler,
+        'full_finetune': args.full_finetune,
     }
     embedding_dim = config.d_model[0]
     model = ECGTSModel(model, embedding_dim, SUBSETS[args.subset], **kwargs)
@@ -280,6 +304,9 @@ if __name__ == "__main__":
             subset=args.subset,
         ))
     
+    monitor_metric = args.monitor_metric
+    monitor_mode = 'max' if monitor_metric == 'val_auroc_epoch' else 'min'
+
     trainer = L.Trainer(
         accelerator="gpu",
         devices=1,
@@ -288,9 +315,9 @@ if __name__ == "__main__":
         max_epochs=num_epochs,
         enable_checkpointing=True,
         callbacks=[
-            ModelCheckpoint(monitor="val_loss_epoch", mode="min", save_top_k=1, save_last=True),
+            ModelCheckpoint(monitor=monitor_metric, mode=monitor_mode, save_top_k=1, save_last=True),
             LearningRateMonitor(),
-            EarlyStopping(monitor="val_loss_epoch", mode="min", patience=10, min_delta=0.0001),
+            EarlyStopping(monitor=monitor_metric, mode=monitor_mode, patience=10, min_delta=0.0001),
         ],
         logger=loggers,
     )
