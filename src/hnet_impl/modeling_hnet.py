@@ -689,7 +689,7 @@ class HNetTS(BlockBoundaryMixin, nn.Module):
     def forward(self, inputs: TT, input_mask: TT):
         assert inputs.ndim == 3 and inputs.shape[2] == 1, "inputs must be a 3D tensor with shape (batch_size, sequence_length, 1)"
 
-        with torch.inference_mode() if self.finetune_mode else nullcontext:
+        with torch.inference_mode() if self.finetune_mode else nullcontext():
             if self.embedding_type == 'simple':
                 assert torch.all(input_mask.shape[1] == 1), "channel_mask must be all 1 for simple embedding"
                 inputs = self.embeddings(inputs)
