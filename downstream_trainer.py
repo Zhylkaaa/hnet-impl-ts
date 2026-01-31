@@ -54,6 +54,7 @@ class ECGTSModel(L.LightningModule):
                  embedding_pulling: str = 'mean', 
                  lr_scheduler: str = 'linear',
                  full_finetune: bool = False,
+                 monitor_metric: str = 'val_auroc_epoch',
                  **kwargs):
         super().__init__()
         self.embedding_model = embedding_model
@@ -157,6 +158,12 @@ class ECGTSModel(L.LightningModule):
             scheduler_kwargs = {
                 'interval': 'epoch',
             }
+        elif self.hparams.lr_scheduler == 'plateau':
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=5, verbose=True)
+            scheduler_kwargs = {
+                'interval': 'epoch',
+                'monitor': self.hparams.monitor_metric,
+            }
         else:
             raise ValueError(f"Invalid lr scheduler: {self.hparams.lr_scheduler}")
         return {
@@ -204,7 +211,7 @@ if __name__ == "__main__":
                         help="Embedding pulling method: 'last' or 'mean'")
     parser.add_argument("--warmup_portion", type=float, default=0.01, 
                         help="Portion of training steps for warmup")
-    parser.add_argument("--lr_scheduler", type=str, default='linear', choices=['linear', 'cosine'],
+    parser.add_argument("--", type=str, default='linear', choices=['linear', 'cosine', 'plateau'],
                         help="Learning rate scheduler type")
     parser.add_argument("--full_finetune", action='store_true', help="Full finetune the model")
     parser.add_argument("--monitor_metric", type=str, default='val_auroc_epoch', choices=['val_auroc_epoch', 'val_loss_epoch'],
@@ -267,6 +274,7 @@ if __name__ == "__main__":
         'warmup_portion': warmup_portion,
         'lr_scheduler': lr_scheduler,
         'full_finetune': args.full_finetune,
+        'monitor_metric': args.monitor_metric,
     }
     embedding_dim = config.d_model[0]
     model = ECGTSModel(model, embedding_dim, SUBSETS[args.subset], **kwargs)
