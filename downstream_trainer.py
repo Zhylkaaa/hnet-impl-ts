@@ -159,7 +159,7 @@ class ECGTSModel(L.LightningModule):
                 'interval': 'epoch',
             }
         elif self.hparams.lr_scheduler == 'plateau':
-            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=5, verbose=True)
+            lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=5, threshold_mode='abs')
             scheduler_kwargs = {
                 'interval': 'epoch',
                 'monitor': self.hparams.monitor_metric,
