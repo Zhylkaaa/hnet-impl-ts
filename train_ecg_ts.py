@@ -208,6 +208,7 @@ if __name__ == "__main__":
                         help="Lambda for reconstruction loss")
     parser.add_argument("--lambda_similarity", type=float, default=1.0,
                         help="Lambda for similarity loss")
+    parser.add_argument("--subsample_sequence", default=None, type=int, help="Subsample sequence length")
     args = parser.parse_args()
     
     data_path = args.data_path
@@ -256,7 +257,7 @@ if __name__ == "__main__":
 
     datamodule = EGCDatamodule(
         data_path, batch_size, num_workers, multichannel=multichannel, 
-        randomize_leads=randomize_leads, mask_probability=mask_probability, mask_range=mask_range
+        randomize_leads=randomize_leads, mask_probability=mask_probability, mask_range=mask_range, subsample_sequence=args.subsample_sequence
     )
 
     kwargs = {
@@ -304,6 +305,7 @@ if __name__ == "__main__":
             multichannel=multichannel,
             randomize_leads=randomize_leads,
             use_decoder=use_decoder,
+            subsample_sequence=args.subsample_sequence,
         ))
     
     trainer = L.Trainer(

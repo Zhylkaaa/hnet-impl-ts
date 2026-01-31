@@ -15,7 +15,7 @@ import augmentations
 
 
 class ECGPretrainDataset(Dataset):
-    def __init__(self, data_path: str, multichannel: bool = False, randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3)):
+    def __init__(self, data_path: str, multichannel: bool = False, randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3), subsample_sequence: int = None):
         self.data_path = data_path
         self.data = h5py.File(data_path, "r")
         self.leads = [k for k in self.data.keys() if k not in ['cum_seq_len', 'date', 'patient_id', 'study_id']]
@@ -26,6 +26,7 @@ class ECGPretrainDataset(Dataset):
         self.noise_data_mat = sio.loadmat('DATA_noises_real.mat')
         self.mask_probability = mask_probability
         self.mask_range = mask_range
+        self.subsample_sequence = subsample_sequence
 
     def __len__(self):
         return len(self.data["cum_seq_len"])
@@ -47,6 +48,8 @@ class ECGPretrainDataset(Dataset):
     
     def _process_ecg(self, lead: str, start_idx: int, end_idx: int):
         ecg = self.data[lead][start_idx:end_idx]
+        if self.subsample_sequence:
+            ecg = ecg[:self.subsample_sequence]
         ecg = self.impute(ecg)
         ecg = augmentations.ecg_positive_augmentation(ecg, lead, 500, self.noise_data_mat, p=0)
         ecg = self.normalize(ecg)
@@ -123,7 +126,8 @@ def collate_fn(batch):
 class EGCDatamodule(L.LightningDataModule):
     def __init__(
         self, base_path: str, batch_size: int, num_workers: int, multichannel: bool = False, 
-        randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3)
+        randomize_leads: bool = False, mask_probability: float = 0.2, mask_range: list[float] = (0.1, 0.3),
+        subsample_sequence: int = None
     ):
         super().__init__()
         self.base_path = base_path
@@ -133,7 +137,14 @@ class EGCDatamodule(L.LightningDataModule):
         self.multichannel = multichannel
         self.randomize_leads = randomize_leads
         # self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "train_data.hdf5"), multichannel=self.multichannel)
-        self.train_dataset = ECGPretrainDataset(os.path.join(self.base_path, "data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
+        self.train_dataset = ECGPretrainDataset(
+            os.path.join(self.base_path, "data.hdf5"), 
+            multichannel=self.multichannel, 
+            randomize_leads=self.randomize_leads, 
+            mask_probability=mask_probability, 
+            mask_range=mask_range, 
+            subsample_sequence=subsample_sequence
+        )
         # self.val_dataset = ECGPretrainDataset(os.path.join(self.base_path, "val_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
         # self.test_dataset = ECGPretrainDataset(os.path.join(self.base_path, "test_data.hdf5"), multichannel=self.multichannel, randomize_leads=self.randomize_leads, mask_probability=mask_probability, mask_range=mask_range)
         
