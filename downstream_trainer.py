@@ -209,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--full_finetune", action='store_true', help="Full finetune the model")
     parser.add_argument("--monitor_metric", type=str, default='val_auroc_epoch', choices=['val_auroc_epoch', 'val_loss_epoch'],
                         help="Metric to monitor for early stopping and checkpointing")
+    parser.add_argument("--subsample_sequence", default=None, type=int, help="Subsample sequence length")
     args = parser.parse_args()
     
     data_path = args.data_path
@@ -257,7 +258,7 @@ if __name__ == "__main__":
         model.requires_grad_(False)
 
     
-    datamodule = PTBXLEGCDatamodule(data_path, args.subset, batch_size, num_workers, use_lead='all' if embedding_type.endswith('multichannel') else 'II')
+    datamodule = PTBXLEGCDatamodule(data_path, args.subset, batch_size, num_workers, use_lead='all' if embedding_type.endswith('multichannel') else 'II', subsample_sequence=args.subsample_sequence)
 
     kwargs = {
         'lr': base_lr,
@@ -302,6 +303,7 @@ if __name__ == "__main__":
             seed=seed,
             pretrained_model_path=pretrained_model_path,
             subset=args.subset,
+            subsample_sequence=args.subsample_sequence,
         ))
     
     monitor_metric = args.monitor_metric

@@ -239,14 +239,17 @@ SUBSETS = {
 
 
 class PTBXLEGCDataset(Dataset):
-    def __init__(self, base_path: str, subset: str, split: str, use_lead: str = 'II'):
+    def __init__(self, base_path: str, subset: str, split: str, use_lead: str = 'II', subsample_sequence: int = None):
         self.base_path = base_path
         self.subset = subset
         self.split = split
         self.use_lead = use_lead
-        print("Loading PTB-XL ECG dataset...")
+        self.subsample_sequence = subsample_sequence
+        #print("Loading PTB-XL ECG dataset...")
         self.data, self.labels = SUBSETS[self.subset](self.base_path, self.split, self.use_lead if self.use_lead != 'all' else None)
-        print("Loaded PTB-XL ECG dataset")
+        #print("Loaded PTB-XL ECG dataset")
+        if self.subsample_sequence:
+            self.data = self.data[:, :self.subsample_sequence]
 
     def __len__(self):
         return len(self.data)
@@ -274,16 +277,16 @@ def collate_ptbxl_fn(batch):
 
 
 class PTBXLEGCDatamodule(L.LightningDataModule):
-    def __init__(self, base_path: str, subset: str, batch_size: int, num_workers: int, use_lead: str = 'II'):
+    def __init__(self, base_path: str, subset: str, batch_size: int, num_workers: int, use_lead: str = 'II', subsample_sequence: int = None):
         super().__init__()
         self.base_path = base_path
         self.subset = subset
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.use_lead = use_lead
-        self.train_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='train', use_lead=self.use_lead)
-        self.val_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='val', use_lead=self.use_lead)
-        self.test_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='test', use_lead=self.use_lead)
+        self.train_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='train', use_lead=self.use_lead, subsample_sequence=subsample_sequence)
+        self.val_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='val', use_lead=self.use_lead, subsample_sequence=subsample_sequence)
+        self.test_dataset = PTBXLEGCDataset(self.base_path, subset=subset, split='test', use_lead=self.use_lead, subsample_sequence=subsample_sequence)
         
         
         self.kwargs = {
