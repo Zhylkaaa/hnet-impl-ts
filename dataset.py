@@ -259,8 +259,15 @@ class PTBXLEGCDataset(Dataset):
         #print("Loading PTB-XL ECG dataset...")
         self.data, self.labels = SUBSETS[self.subset](self.base_path, self.split, self.use_lead if self.use_lead != 'all' else None)
         #print("Loaded PTB-XL ECG dataset")
+        self._filter_data()
         if self.subsample_sequence:
             self.data = self.data[:, :self.subsample_sequence]
+            
+    def _filter_data(self):
+        # apparently there are examples with no label at all
+        mask = self.labels.sum(axis=1) > 0
+        self.data = self.data[mask]
+        self.labels = self.labels[mask]
 
     def __len__(self):
         return len(self.data)
