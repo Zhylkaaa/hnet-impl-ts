@@ -277,7 +277,7 @@ if __name__ == "__main__":
         'monitor_metric': args.monitor_metric,
     }
     embedding_dim = config.d_model[0]
-    model = ECGTSModel(model, embedding_dim, SUBSETS[args.subset], **kwargs)
+    model = ECGTSModel(model, embedding_dim, datamodule.num_labels, **kwargs)
 
     loggers = [WandbLogger(project="ecg-ts-ptbxl")]
 
